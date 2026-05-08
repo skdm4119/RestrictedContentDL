@@ -58,7 +58,7 @@ user = Client(
 
 RUNNING_TASKS = set()
 download_semaphore = None
-BATCH_STATES = {}  # Stores state for user interactions: {user_id: {'step': '...', 'data': ...}}
+BATCH_STATES = {}  
 
 # GLOBAL SETTING FOR DESTINATION CHANNEL
 DESTINATION_CHAT_ID = None
@@ -121,9 +121,7 @@ async def help_command(_, message: Message):
     )
     await message.reply(help_text, reply_markup=markup, disable_web_page_preview=True)
 
-# -------------------------------------------------------------------------------------
-# DESTINATION CHANNEL SETTING
-# -------------------------------------------------------------------------------------
+
 @bot.on_message(filters.command("set") & filters.private)
 async def set_destination(bot: Client, message: Message):
     global DESTINATION_CHAT_ID
@@ -171,7 +169,7 @@ async def set_destination(bot: Client, message: Message):
 # -------------------------------------------------------------------------------------
 # CORE DOWNLOAD LOGIC
 # -------------------------------------------------------------------------------------
-async def handle_download(bot: Client, message: Message, post_url: str, silent: bool = False):
+async def handle_download(bot: Client, message: Message, post_url: str, silent: bool = False, pre_fetched_msg=None):
     async with download_semaphore:
         if "?" in post_url:
             post_url = post_url.split("?", 1)[0]
@@ -179,9 +177,13 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
         target_chat_id = DESTINATION_CHAT_ID if DESTINATION_CHAT_ID else message.chat.id
 
         try:
-            # Updated to unpack the 3 elements
             chat_id, message_id, thread_id = getChatMsgID(post_url)
-            chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
+            
+            # OPTIMIZATION: Use pre-fetched message if available to save API calls
+            if pre_fetched_msg:
+                chat_message = pre_fetched_msg
+            else:
+                chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
             
             LOGGER(__name__).info(f"Processing URL: {post_url}")
             
@@ -354,10 +356,16 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 if not silent:
                     await message.reply("**No media or text found in the post URL.**")
 
+        except FloodWait as e:
+            # Re-raise to break batch operations
+            raise e
         except (PeerIdInvalid, BadRequest, KeyError):
             if not silent:
                 await message.reply(f"**Error processing {post_url}: User client likely not in chat.**")
         except Exception as e:
+            if "FLOOD_WAIT" in str(e).upper():
+                raise e # Re-raise if it's a flood wait masked inside another exception
+            
             error_message = f"**❌ Error at {post_url}: {str(e)}**"
             if not silent:
                 await message.reply(error_message)
@@ -370,7 +378,14 @@ async def download_media(bot: Client, message: Message):
         await message.reply("**Provide a post URL after the /dl command.**")
         return
     post_url = message.command[1]
-    await track_task(handle_download(bot, message, post_url, silent=False))
+    
+    try:
+        await track_task(handle_download(bot, message, post_url, silent=False))
+    except FloodWait as e:
+        await message.reply(f"🚨 **FloodWait Triggered!**\nTelegram requires a wait of `{e.value}` seconds.")
+    except Exception as e:
+        if "FLOOD_WAIT" in str(e).upper():
+             await message.reply(f"🚨 **FloodWait Triggered!**")
 
 
 # -------------------------------------------------------------------------------------
@@ -419,20 +434,21 @@ async def handle_text_and_states(bot: Client, message: Message):
             return
 
     if message.text and not message.text.startswith("/"):
-        await track_task(handle_download(bot, message, message.text, silent=False))
+        try:
+            await track_task(handle_download(bot, message, message.text, silent=False))
+        except FloodWait as e:
+            await message.reply(f"🚨 **FloodWait Triggered!**\nTelegram requires a wait of `{e.value}` seconds.")
 
 
 # Helper to run the batch loop
 async def execute_batch_logic(bot: Client, message: Message, start_link: str, count: int):
     try:
-        # Extract thread ID here to filter by later
         start_chat, start_id, start_thread_id = getChatMsgID(start_link)
     except Exception as e:
         return await message.reply(f"**❌ Error parsing start link:\n{e}**")
 
     # Calculate End ID
     end_id = start_id + count - 1
-    
     prefix = start_link.rsplit("/", 1)[0]
     
     thread_text = f"\n**Topic/Thread Filter Active**: ID `{start_thread_id}`" if start_thread_id else ""
@@ -447,16 +463,21 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
     skipped_streak = 0
     batch_tasks = []
     BATCH_SIZE = PyroConf.BATCH_SIZE
+    batch_aborted = False
 
     for msg_id in range(start_id, end_id + 1):
+        if batch_aborted:
+            break
+            
         url = f"{prefix}/{msg_id}"
         try:
             try:
+                # API Call #1: Fetch message to check existence & type
                 chat_msg = await user.get_messages(chat_id=start_chat, message_ids=msg_id)
             except FloodWait as e:
-                LOGGER(__name__).warning(f"FloodWait while fetching {url}. Sleeping {e.value}s.")
-                await asyncio.sleep(e.value)
-                chat_msg = await user.get_messages(chat_id=start_chat, message_ids=msg_id)
+                await message.reply(f"🚨 **Batch Halted: FloodWait Triggered!**\nTelegram requires a wait of `{e.value}` seconds. The process has been safely stopped to protect your account.")
+                batch_aborted = True
+                break
 
             if not chat_msg or getattr(chat_msg, 'empty', False):
                 skipped += 1
@@ -466,12 +487,9 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
                     skipped_streak = 0
                 continue
 
-            # ------------- NEW: TOPIC FILTERING -------------
+            # ------------- TOPIC FILTERING -------------
             if start_thread_id:
-                # Get the thread ID of the fetched message
                 msg_thread = getattr(chat_msg, "message_thread_id", None)
-                
-                # If it doesn't belong to the requested Topic/Thread, skip it!
                 if msg_thread != start_thread_id:
                     skipped += 1
                     skipped_streak += 1
@@ -492,41 +510,61 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
                 continue
             skipped_streak = 0
 
-            task = track_task(handle_download(bot, message, url, silent=False))
+            # OPTIMIZATION: Pass the already fetched chat_msg to prevent a redundant API call inside
+            task = track_task(handle_download(bot, message, url, silent=False, pre_fetched_msg=chat_msg))
             batch_tasks.append(task)
 
             if len(batch_tasks) >= BATCH_SIZE:
                 results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+                
                 for result in results:
                     if isinstance(result, asyncio.CancelledError):
                         await loading.delete()
-                        return await message.reply(
-                            f"**❌ Batch canceled** after processing `{downloaded}` posts."
-                        )
+                        return await message.reply(f"**❌ Batch canceled** after processing `{downloaded}` posts.")
+                    elif isinstance(result, FloodWait):
+                        await message.reply(f"🚨 **Batch Halted: FloodWait Triggered!**\nTelegram requires a wait of `{result.value}` seconds. The process has been safely stopped.")
+                        batch_aborted = True
+                        break
                     elif isinstance(result, Exception):
+                        if "FLOOD_WAIT" in str(result).upper():
+                            await message.reply(f"🚨 **Batch Halted: FloodWait Triggered!**\nThe process has been safely stopped to protect your account.")
+                            batch_aborted = True
+                            break
                         failed += 1
-                        LOGGER(__name__).error(f"Error: {result}")
+                        LOGGER(__name__).error(f"Error in batch gather: {result}")
                     else:
                         downloaded += 1
 
                 batch_tasks.clear()
-                await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
+                if not batch_aborted:
+                    await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
 
         except Exception as e:
+            if "FLOOD_WAIT" in str(e).upper():
+                 await message.reply(f"🚨 **Batch Halted: FloodWait Triggered!**")
+                 batch_aborted = True
+                 break
             failed += 1
             LOGGER(__name__).error(f"Error at {url}: {e}")
 
-    if batch_tasks:
+    # Clear out remaining tasks if batch wasn't aborted
+    if batch_tasks and not batch_aborted:
         results = await asyncio.gather(*batch_tasks, return_exceptions=True)
         for result in results:
-            if isinstance(result, Exception):
+            if isinstance(result, FloodWait) or ("FLOOD_WAIT" in str(result).upper() if isinstance(result, Exception) else False):
+                await message.reply(f"🚨 **Batch Halted: FloodWait Triggered!**")
+                break
+            elif isinstance(result, Exception):
                 failed += 1
             else:
                 downloaded += 1
 
     await loading.delete()
+    
+    completion_text = "**✅ Batch Process Complete!**" if not batch_aborted else "**🛑 Batch Process Stopped (FloodWait)**"
+    
     await message.reply(
-        "**✅ Batch Process Complete!**\n"
+        f"{completion_text}\n"
         "━━━━━━━━━━━━━━━━━━━\n"
         f"📥 **Processed** : `{downloaded}`\n"
         f"⏭️ **Skipped** : `{skipped}`\n"
